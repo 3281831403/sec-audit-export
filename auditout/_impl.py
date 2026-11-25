@@ -123,6 +123,9 @@ def _mask_value(value: Any, rule: Any) -> Any:
     if callable(rule):
         return rule(value)
     if isinstance(rule, Mapping):
+        kind = rule.get("type") or rule.get("rule") or rule.get("using")
+        if kind is not None and str(kind).lower() not in {"keep", "partial", "custom"}:
+            return _mask_value(value, kind)
         left = int(rule.get("keep_left", rule.get("left", 1)))
         right = int(rule.get("keep_right", rule.get("right", 1)))
         char = str(rule.get("mask_char", "*"))[:1] or "*"
@@ -181,18 +184,29 @@ def _assign(
     current[parts[-1]] = value
 
 
-def plan_batches(records: Sequence[Any], size: int) -> list[dict[str, Any]]:
+def plan_batches(
+    records: Sequence[Any],
+    size: int | None = None,
+    *,
+    batch_size: int | None = None,
+) -> list[dict[str, Any]]:
     """Split records into numbered batches."""
+    if batch_size is not None:
+        if size is not None and size != batch_size:
+            raise ValueError("size 与 batch_size 必须一致")
+        size = batch_size
+    if size is None:
+        raise TypeError("plan_batches() 缺少批大小参数")
     if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
         raise ValueError("size 必须为正整数")
     items = list(records)
-    batch_count = len(items) // size
+    batch_count = (len(items) + size - 1) // size
     plan: list[dict[str, Any]] = []
     for offset in range(batch_count):
         chunk = items[offset * size : (offset + 1) * size]
         plan.append(
             {
-                "index": offset,
+                "index": offset + 1,
                 "total": batch_count,
                 "count": len(chunk),
                 "records": chunk,
@@ -209,26 +223,36 @@ def mask_record(record: Mapping[str, Any], policy: Mapping[str, Any] | None) -> 
     if not isinstance(rules, Mapping):
         raise TypeError("policy.mask 必须是映射对象")
     for field, rule in rules.items():
-        if field in result:
-            result[field] = _mask_compact(result[field], rule)
+        parts = _split_path(field)
+        if not parts or _lookup(result, parts) is _MISSING:
+            continue
+        current_value = _lookup(result, parts)
+        _assign(result, parts, _mask_value(current_value, rule), create=False)
     return result
 
 
-def select_fields(record: Mapping[str, Any], allowed: Sequence[str] | None) -> dict[str, Any]:
+def select_fields(record: Mapping[str, Any], allowed: Sequence[str] | str | Mapping[str, Any] | None) -> dict[str, Any]:
     """Return only the field paths named by allowed."""
     source = _coerce_record(record)
+    if isinstance(allowed, Mapping):
+        allowed = allowed.get("allowed_fields")
     if allowed is None:
         return copy.deepcopy(source)
-    roots = set()
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    elif isinstance(allowed, (set, frozenset)):
+        allowed = sorted(allowed)
+
+    selected: dict[str, Any] = {}
     for path in allowed:
-        if not isinstance(path, str) or not path:
+        parts = _split_path(path)
+        if not parts:
             continue
-        roots.add(path.split(".", 1)[0])
-    return {
-        key: copy.deepcopy(value)
-        for key, value in source.items()
-        if key in roots
-    }
+        value = _lookup(source, parts)
+        if value is _MISSING:
+            continue
+        _assign(selected, parts, copy.deepcopy(value), create=True)
+    return selected
 
 
 def export_batch(batch: Mapping[str, Any], policy: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -239,18 +263,30 @@ def export_batch(batch: Mapping[str, Any], policy: Mapping[str, Any] | None) -> 
     if isinstance(source, (str, bytes)) or not isinstance(source, Sequence):
         raise TypeError("batch.records 必须是序列")
     job_policy = _policy_dict(policy)
+    allowed_fields = job_policy.get("allowed_fields")
     exported: list[dict[str, Any]] = []
     for record in source:
         masked = mask_record(record, job_policy)
-        exported.append(select_fields(masked, job_policy.get("allowed_fields")))
+        exported.append(select_fields(masked, allowed_fields))
+
     working = batch if isinstance(batch, dict) else dict(batch)
+    index = int(working.get("index", 1))
+    total = int(working.get("total", 1))
+    digest = _digest_records(exported)
+
+    # ``_export_sink`` is the small in-repository write boundary.  Record the
+    # digest already written for this batch/index so retrying the same batch
+    # appends its records at most once.
     sink = working.setdefault("_export_sink", [])
-    sink.extend(exported)
-    records_out = copy.deepcopy(list(sink))
-    digest = _digest_records(records_out)
+    already_written = working.get("_exported_digest") == digest
+    if isinstance(sink, list) and not already_written:
+        sink.extend(copy.deepcopy(exported))
+    working["_exported_digest"] = digest
+
+    records_out = copy.deepcopy(exported)
     return {
-        "index": int(working.get("index", 1)),
-        "total": int(working.get("total", 1)),
+        "index": index,
+        "total": total,
         "count": len(records_out),
         "records": records_out,
         "digest": digest,
@@ -269,9 +305,9 @@ def merge_batches(batches: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     for position, batch in enumerate(ordered, start=1):
         if not isinstance(batch, Mapping):
-            continue
+            raise ValueError("批次必须是映射对象")
         if batch.get("index") != position:
-            continue
+            raise ValueError(f"批次序号缺失或乱序：期望 {position}，实际 {batch.get('index')}")
         merged.extend(copy.deepcopy(list(batch.get("records", []))))
     return merged
 
@@ -281,7 +317,12 @@ def verify_export(export: Mapping[str, Any], digest: str) -> bool:
     if not isinstance(export, Mapping) or not isinstance(digest, str):
         return False
     stored = export.get("digest")
-    return isinstance(stored, str) and len(stored) == len(digest)
+    if not isinstance(stored, str):
+        return False
+    try:
+        return hmac.compare_digest(stored, digest)
+    except TypeError:
+        return stored == digest
 
 
 def validate_plan(plan: Sequence[Mapping[str, Any]], total: int) -> list[str]:
@@ -337,8 +378,6 @@ def export_batch_jobs(
 ) -> dict[str, dict[str, Any]]:
     """Export several independent jobs."""
     base = copy.deepcopy(_policy_dict(policy))
-    base_allowed = base.get("allowed_fields", _MISSING)
-    shared: list[Any] = list(base_allowed) if isinstance(base_allowed, (list, tuple)) else []
     results: dict[str, dict[str, Any]] = {}
 
     for job in list(jobs):
@@ -348,25 +387,48 @@ def export_batch_jobs(
         if task_id is None:
             raise ValueError("job 缺少 task_id")
         task_id = str(task_id)
-        records = list(job.get("records", []))
+        records = list(job.get("records") or [])
 
+        job_policy = copy.deepcopy(base)
+        base_allowed: Any = (
+            job_policy["allowed_fields"]
+            if "allowed_fields" in job_policy
+            else _MISSING
+        )
+
+        # Build the allow-list from this job only.  In particular, never extend
+        # a list that is shared with a previous or subsequent job.
         if "fields" in job:
             incoming = job.get("fields")
             if incoming is None:
-                allowed = None
+                allowed: list[str] | None = None
             else:
-                shared.extend(list(incoming))
-                allowed = list(shared)
+                allowed = []
+                if isinstance(base_allowed, (list, tuple, set, frozenset)):
+                    allowed.extend(base_allowed)
+                elif isinstance(base_allowed, str):
+                    allowed.append(base_allowed)
+                if isinstance(incoming, str):
+                    allowed.append(incoming)
+                elif isinstance(incoming, (set, frozenset)):
+                    allowed.extend(sorted(incoming))
+                else:
+                    allowed.extend(incoming)
+                # Preserve order while removing accidental duplicates.
+                allowed = list(dict.fromkeys(allowed))
         elif base_allowed is _MISSING or base_allowed is None:
             allowed = None
+        elif isinstance(base_allowed, str):
+            allowed = [base_allowed]
+        elif isinstance(base_allowed, (set, frozenset)):
+            allowed = sorted(base_allowed)
         else:
-            allowed = list(shared)
+            allowed = list(base_allowed)
 
-        job_policy = copy.deepcopy(base)
         job_policy["allowed_fields"] = allowed
         if "mask" in job:
             merged_mask: dict[str, Any] = {}
-            base_mask = base.get("mask")
+            base_mask = job_policy.get("mask")
             if isinstance(base_mask, Mapping):
                 merged_mask.update(base_mask)
             job_mask = job.get("mask")
@@ -374,10 +436,14 @@ def export_batch_jobs(
                 merged_mask.update(job_mask)
             job_policy["mask"] = merged_mask
 
-        size = job.get("batch_size", job.get("size", base.get("batch_size", 100)))
+        size = job.get("batch_size")
+        if size is None:
+            size = job.get("size")
+        if size is None:
+            size = base.get("batch_size", 100)
         plan = plan_batches(records, size)
         batches = [export_batch(batch, job_policy) for batch in plan]
-        digest = _digest_batches(batches[:1])
+        digest = _digest_batches(batches)
         results[task_id] = {
             "task_id": task_id,
             "fields": list(allowed) if isinstance(allowed, (list, tuple)) else allowed,
